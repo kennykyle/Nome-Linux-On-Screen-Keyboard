@@ -5084,6 +5084,7 @@ export default class OSKExtension extends Extension {
         const type = event.type();
         if (!this._isPointerLikeEvent(type))
             return false;
+        this._dropFinishedMousePress(event, type);
 
         const keyboard = this._keyboardOrNull('_maybeHandleShellKeyboardEvent');
         if (!keyboard || !keyboard.visible) {
@@ -5151,8 +5152,10 @@ export default class OSKExtension extends Extension {
         let target = this._modalPointerTarget || null;
         if (!target || startsPointerSequence) {
             target = hitHandler || null;
-            if (startsPointerSequence)
+            if (startsPointerSequence) {
                 this._modalPointerTarget = target;
+                this._modalPointerTargetIsTouch = isTouchEventType(type);
+            }
         }
 
         if (!target || !this._isKeyboardDescendant(target))
@@ -5178,6 +5181,19 @@ export default class OSKExtension extends Extension {
             this._modalPointerTarget = null;
 
         return result !== Clutter.EVENT_PROPAGATE;
+    }
+
+    // A mouse press the bridges routed can finish where they never see
+    // its release: the title bar's mouse drag takes its own grab, so the
+    // release goes straight to the title bar.  The leftover target then
+    // swallowed every later mouse motion on the desktop until the next
+    // click.  A motion with no button held means that press is over.
+    _dropFinishedMousePress(event, type) {
+        if (type !== Clutter.EventType.MOTION || !this._modalPointerTarget
+            || this._modalPointerTargetIsTouch)
+            return;
+        if (!this._eventHasButtonOrTouchGrab(event, type))
+            this._modalPointerTarget = null;
     }
 
     // True while the keyboard is being dragged or resized by a press the
@@ -5318,6 +5334,7 @@ export default class OSKExtension extends Extension {
             type !== Clutter.EventType.TOUCH_CANCEL) {
             return Clutter.EVENT_PROPAGATE;
         }
+        this._dropFinishedMousePress(event, type);
         const keyboard = this._keyboardOrNull('_onStageCapturedEvent');
         if (!keyboard)
             return Clutter.EVENT_PROPAGATE;
@@ -5399,8 +5416,10 @@ export default class OSKExtension extends Extension {
         let target = this._modalPointerTarget || null;
         if (!target || startsPointerSequence) {
             target = capturedHandler;
-            if (startsPointerSequence)
+            if (startsPointerSequence) {
                 this._modalPointerTarget = target || null;
+                this._modalPointerTargetIsTouch = isTouchEventType(type);
+            }
         }
         if (!target || !this._isKeyboardDescendant(target))
             return Clutter.EVENT_PROPAGATE;
