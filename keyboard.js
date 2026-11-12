@@ -1531,7 +1531,7 @@ export const OSKKeyboard = GObject.registerClass({
 }, class OSKKeyboard extends St.BoxLayout {
     _init(virtualDevice, layoutKey, customization, userThemes) {
         super._init({
-            vertical: true,
+            orientation: Clutter.Orientation.VERTICAL,
             style_class: 'osk-keyboard',
             reactive: true,
             visible: false,
