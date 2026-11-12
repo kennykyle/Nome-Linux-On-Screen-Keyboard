@@ -1,12 +1,15 @@
 /* Nome - Onscreen Keyboard panel indicator. */
 
 import Clutter from 'gi://Clutter';
+import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+
+import { isOtherFinger, longPressMs, touchSlot } from './modalAuth.js';
 
 export const OSKIndicator = GObject.registerClass(
 class OSKIndicator extends PanelMenu.Button {
@@ -21,7 +24,8 @@ class OSKIndicator extends PanelMenu.Button {
         // With dontCreateMenu=true, this.menu is a PopupDummyMenu
         // whose toggle() is a no-op, so the default handling is
         // harmless.  We create a separate PopupMenu as _rcMenu and
-        // open/close it explicitly on right-click in vfunc_event.
+        // open/close it explicitly on right-click (or a long finger
+        // press) in vfunc_event.
         super._init(0.0, 'Nome - Onscreen Keyboard', true);
         this._ext = ext;
 
@@ -56,7 +60,14 @@ class OSKIndicator extends PanelMenu.Button {
         this._hoverOpens = false;
         this._enterEventId = 0;
 
+        // Finger state: a tap toggles the keyboard, holding opens the menu.
+        this._touchHeld = false;
+        this._touchSlot = null;
+        this._touchLongPressed = false;
+        this._longPressId = 0;
+
         this.connect('destroy', () => {
+            this._clearTouchPress();
             if (!this._rcMenu) return;
             this._rcMenu.destroy();
             this._rcMenu = null;
@@ -85,6 +96,10 @@ class OSKIndicator extends PanelMenu.Button {
     // any signal-based handler in the parent calls this.menu.toggle(),
     // which is a no-op because we passed dontCreateMenu=true (see
     // _init).  So both code paths are covered.
+    //
+    // On a touchscreen a quick tap acts like the left-click and holding
+    // a finger on the icon opens the menu, since fingers can't
+    // right-click.
     vfunc_event(event) {
         const type = event.type();
         if (type === Clutter.EventType.BUTTON_PRESS) {
@@ -105,12 +120,49 @@ class OSKIndicator extends PanelMenu.Button {
             return Clutter.EVENT_STOP;
         }
         if (type === Clutter.EventType.TOUCH_BEGIN) {
-            if (this._rcMenu && this._rcMenu.isOpen)
-                this._rcMenu.close();
-            this._ext._setVisible(!this._ext._keyboard.visible);
+            // Every new finger starts fresh, so a lift that never reached
+            // us (e.g. taken by the menu's grab) can't leave the icon stuck.
+            this._clearTouchPress();
+            this._touchHeld = true;
+            this._touchSlot = touchSlot(event);
+            this._longPressId = GLib.timeout_add(
+                GLib.PRIORITY_DEFAULT, longPressMs(), () => {
+                    this._longPressId = 0;
+                    this._touchLongPressed = true;
+                    if (this._rcMenu && !this._rcMenu.isOpen)
+                        this._rcMenu.open();
+                    return GLib.SOURCE_REMOVE;
+                });
             return Clutter.EVENT_STOP;
         }
+        if (type === Clutter.EventType.TOUCH_END
+            || type === Clutter.EventType.TOUCH_CANCEL) {
+            if (!this._touchHeld || isOtherFinger(event, this._touchSlot))
+                return Clutter.EVENT_STOP;
+            const wasLongPress = this._touchLongPressed;
+            this._clearTouchPress();
+            // A quick tap does what a left-click does.
+            if (type === Clutter.EventType.TOUCH_END && !wasLongPress) {
+                if (this._rcMenu && this._rcMenu.isOpen)
+                    this._rcMenu.close();
+                const keyboard = this._ext._keyboard;
+                this._ext._setVisible(!(keyboard && keyboard.visible));
+            }
+            return Clutter.EVENT_STOP;
+        }
+        if (type === Clutter.EventType.TOUCH_UPDATE)
+            return Clutter.EVENT_STOP;
         return Clutter.EVENT_PROPAGATE;
+    }
+
+    _clearTouchPress() {
+        if (this._longPressId) {
+            GLib.source_remove(this._longPressId);
+            this._longPressId = 0;
+        }
+        this._touchHeld = false;
+        this._touchSlot = null;
+        this._touchLongPressed = false;
     }
 
     getRightClickMenu() {
