@@ -1,4 +1,4 @@
-/* Nome - Onscreen Keyboard -- Shell Extension for GNOME 50.
+/* Nome - Onscreen Keyboard -- Shell Extension for GNOME 50 and 51.
  *
  * Runs inside Mutter.  That's the whole point of being a Shell
  * extension: a third-party Wayland app can't stay on top or inject
@@ -7,6 +7,8 @@
  *
  *   - Stay on top: the keyboard actor is added to Main.layoutManager's
  *     chrome layer, which is always rendered above normal windows.
+ *     On GNOME 51 it sits in Mutter's input panel group (also chrome,
+ *     next to Shell's own OSK) so Shell modal grabs can't block it.
  *   - No focus stealing: chrome actors don't participate in Wayland
  *     seat focus, so tapping a key doesn't move focus away from the
  *     text field the user was editing.
@@ -20,6 +22,7 @@ import Clutter from 'gi://Clutter';
 import St from 'gi://St';
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
+import Meta from 'gi://Meta';
 // Cairo is the drawing backend used by the RGB row glow canvases and
 // the color wheel widget.  GJS exposes it under the 'cairo' import
 // (no `gi://` prefix).
@@ -62,6 +65,50 @@ import {
     OSK_MODAL_HOVER_THROTTLE_US, isAuthSessionModeName,
     isPointerLikeEventType, isPointerTrackingOnlyEventType,
 } from './modalAuth.js';
+
+const DWELL_TYPING_POLL_MS = 50;
+const DWELL_TYPING_DELAY_US = 650000;
+
+// GNOME Shell 51 removed Clutter.get_default_backend(); the backend now
+// belongs to the stage's Clutter.Context.  Look it up there first and
+// keep the old global only as a fallback for GNOME 50.
+function _clutterBackend() {
+    const stage = global.stage;
+    let context = null;
+    try {
+        if (stage && typeof stage.get_context === 'function')
+            context = stage.get_context();
+        else if (stage)
+            context = stage.context;
+    } catch (_e) {
+        context = null;
+    }
+    if (context && typeof context.get_backend === 'function') {
+        const backend = context.get_backend();
+        if (backend)
+            return backend;
+    }
+    if (typeof Clutter.get_default_backend === 'function')
+        return Clutter.get_default_backend();
+    throw new Error('no Clutter backend available');
+}
+
+// GNOME Shell 51 hosts on-screen keyboards in Mutter's input panel
+// group, which Mutter registers as the stage's "grab chrome": while a
+// Shell modal dialog or popup menu holds a pointer grab, pointer events
+// aimed at actors inside that group are still delivered to them.  51
+// also removed the Main.keyboard.maybeHandleEvent() forwarding that
+// the GNOME 50 modal bridge relies on, so this group is how Nome stays
+// usable over password prompts.  Returns null on GNOME 50.
+function _inputPanelGroup() {
+    try {
+        const compositor = global.compositor;
+        if (compositor
+            && typeof compositor.get_input_panel_group === 'function')
+            return compositor.get_input_panel_group() || null;
+    } catch (_e) {}
+    return null;
+}
 
 
 // Runtime modules:
@@ -112,6 +159,8 @@ export default class OSKExtension extends Extension {
         this._authKeyboardHost = null;
         this._authKeyboardHostDestroyId = 0;
         this._keyboardInAuthHost = false;
+        this._keyboardInInputPanel = false;
+        this._keyboardGrabChromeEventId = 0;
         this._modalBridgeGrab = null;
         this._modalBridgePreVisible = undefined;
         this._modalBridgeModalActor = null;
@@ -119,10 +168,16 @@ export default class OSKExtension extends Extension {
         this._modalHoverLastUs = 0;
         this._modalHoverLastX = null;
         this._modalHoverLastY = null;
+        this._dwellTypingEnabled = false;
+        this._dwellPollId = 0;
+        this._dwellTarget = null;
+        this._dwellTargetStartUs = 0;
         this._shellKeyboardBridgeInstalled = false;
         this._shellKeyboardBridgeManager = null;
         this._shellKeyboardBridgeOriginal = null;
         this._shellKeyboardBridgeWrapper = null;
+        this._focusWindowNotifyId = 0;
+        this._lastFocusedWindow = null;
         try {
             if (Main.sessionMode && Main.sessionMode.connect) {
                 this._sessionModeUpdatedId = Main.sessionMode.connect(
@@ -160,7 +215,7 @@ export default class OSKExtension extends Extension {
         // Mutter as real keyboard input and routed to whichever window
         // has Wayland seat focus -- which stays put because chrome
         // actors (our keyboard) don't take focus on click.
-        const seat = Clutter.get_default_backend().get_default_seat();
+        const seat = _clutterBackend().get_default_seat();
         this._virtualDevice = seat.create_virtual_device(
             Clutter.InputDeviceType.KEYBOARD_DEVICE
         );
@@ -195,6 +250,10 @@ export default class OSKExtension extends Extension {
                                          initialLayoutKey,
                                          initialCustomization,
                                          initialUserThemes);
+        if (this._keyboard.setBeforeKeyDispatchCallback) {
+            this._keyboard.setBeforeKeyDispatchCallback(
+                () => this._preserveFocusedWindowForKey());
+        }
         const keyboardActor = this._keyboard;
         keyboardActor.connect('destroy', () => {
             if (this._keyboard === keyboardActor) {
@@ -202,10 +261,19 @@ export default class OSKExtension extends Extension {
                 this._keyboard = null;
                 this._modalPointerTarget = null;
                 this._keyboardInAuthHost = false;
+                this._keyboardInInputPanel = false;
+                this._keyboardGrabChromeEventId = 0;
+                this._stopDwellPointerPoll();
                 this._clearCapturedHover();
                 this._cancelAuthVisibilityRetry();
             }
         });
+        // GNOME 51+: pointer events that reach Nome through the input
+        // panel grab chrome while another actor holds the grab.  See
+        // _onKeyboardGrabChromeEvent().
+        this._keyboardGrabChromeEventId = keyboardActor.connect(
+            'captured-event',
+            (_actor, event) => this._onKeyboardGrabChromeEvent(event));
         this._keyboard.setAuthMode(this._authSessionMode);
         // Keep the actor hidden until geometry is final.  Otherwise
         // Shell can paint one frame at natural size near the origin
@@ -245,16 +313,16 @@ export default class OSKExtension extends Extension {
         // (previous versions accepted it; 50 throws on it).  Passing
         // only the options Shell 50 still accepts.
         //
-        // Top chrome keeps the OSK visible above normal windows.  In
-        // normal desktop sessions we do not reparent or grab around
-        // Shell system modals; those paths can block the popup input
-        // stack on some GNOME Shell builds.
+        // Top chrome keeps the OSK visible above normal windows.  Keep
+        // pointer interception scoped to Nome coordinates so app
+        // popups do not see OSK taps as outside clicks.
         this._addKeyboardToChrome('enable');
         this._keyboard._queuePostLayoutRefresh();
         if (this._authSessionMode)
             this._installModalAwareInput();
-        else
+        if (!this._authSessionMode)
             this._installShellKeyboardEventBridge();
+        this._installFocusWindowTracker();
         this._installModalRaiseHooks();
 
         // One-line diagnostic to journal so we can see what coords were
@@ -280,6 +348,8 @@ export default class OSKExtension extends Extension {
         // in _loadConfig, so a missing config file => prediction off.
         this._keyboard.setPredictionEnabled(
             !this._authSessionMode && !!this._config.predictionEnabled);
+        this._dwellTypingEnabled = !this._authSessionMode
+            && !!this._config.dwellTypingEnabled;
 
         // Panel indicator.  Left-click toggles the keyboard, right-click
         // opens a popup populated by _buildIndicatorMenu.  See the
@@ -649,6 +719,18 @@ export default class OSKExtension extends Extension {
         }
         menu.addMenuItem(repeatItem);
 
+        // -- Popup-safe hover typing --------------------------------
+        // GTK popovers dismiss on outside clicks before Shell chrome
+        // actors can receive them.  This optional mode reads pointer
+        // position while the keyboard is visible and types a key after
+        // a short hover, so no click has to hit the popover at all.
+        const dwellItem = new PopupMenu.PopupSwitchMenuItem(
+            'Popup-safe hover typing', !!this._dwellTypingEnabled);
+        dwellItem.connect('toggled', (_item, state) => {
+            this._setDwellTypingEnabled(state, true);
+        });
+        menu.addMenuItem(dwellItem);
+
         menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         // -- Customize... -------------------------------------------
@@ -974,7 +1056,7 @@ export default class OSKExtension extends Extension {
         this._pickerTarget = null;
 
         const root = new St.BoxLayout({
-            vertical: true,
+            orientation: Clutter.Orientation.VERTICAL,
             reactive: true,
             track_hover: true,
             style_class: 'osk-customize-window',
@@ -1004,7 +1086,7 @@ export default class OSKExtension extends Extension {
         });
 
         const body = new St.BoxLayout({
-            vertical: true,
+            orientation: Clutter.Orientation.VERTICAL,
             x_expand: true,
             style_class: 'osk-customize-body',
         });
@@ -1219,7 +1301,7 @@ export default class OSKExtension extends Extension {
         });
         parent.add_child(sub);
 
-        const gridWrap = new St.BoxLayout({ vertical: true, x_expand: true });
+        const gridWrap = new St.BoxLayout({ orientation: Clutter.Orientation.VERTICAL, x_expand: true });
         gridWrap.spacing = 8;
         parent.add_child(gridWrap);
 
@@ -1274,7 +1356,7 @@ export default class OSKExtension extends Extension {
 
     _buildThemeCard(id, label, builtIn, active) {
         const card = new St.BoxLayout({
-            vertical: true,
+            orientation: Clutter.Orientation.VERTICAL,
             x_expand: true,
             reactive: true,
             track_hover: true,
@@ -2240,7 +2322,7 @@ export default class OSKExtension extends Extension {
         // Hidden-by-default content container.  Caller adds rows to
         // this; we just toggle its `.visible` on header clicks.
         const content = new St.BoxLayout({
-            vertical: true,
+            orientation: Clutter.Orientation.VERTICAL,
             x_expand: true,
         });
         content.set_style('padding: 4px 0 0 8px;');
@@ -2513,7 +2595,7 @@ export default class OSKExtension extends Extension {
         // (no transparency wash) so the picker doesn't read as a
         // separate "glassy" overlay.
         const panel = new St.BoxLayout({
-            vertical: true,
+            orientation: Clutter.Orientation.VERTICAL,
             reactive: true,
             track_hover: true,
         });
@@ -2982,7 +3064,7 @@ export default class OSKExtension extends Extension {
             });
 
             const box = new St.BoxLayout({
-                vertical: true,
+                orientation: Clutter.Orientation.VERTICAL,
                 x_expand: true,
                 y_expand: true,
             });
@@ -3043,6 +3125,7 @@ export default class OSKExtension extends Extension {
         return {
             configVersion: CONFIG_VERSION,
             predictionEnabled: false,
+            dwellTypingEnabled: false,
             showOnStartup: true,
             layout: DEFAULT_LAYOUT_KEY,
             customization: Object.assign({}, DEFAULT_CUSTOMIZATION),
@@ -3088,6 +3171,7 @@ export default class OSKExtension extends Extension {
             return {
                 configVersion: CONFIG_VERSION,
                 predictionEnabled: cfg.predictionEnabled === true,
+                dwellTypingEnabled: cfg.dwellTypingEnabled === true,
                 showOnStartup: cfg.showOnStartup !== false,
                 layout: LAYOUTS[cfg.layout] ? cfg.layout : DEFAULT_LAYOUT_KEY,
                 customization: _sanitizeCustomization(
@@ -3170,11 +3254,12 @@ export default class OSKExtension extends Extension {
     // build they're running.
     _showHelp() {
         try {
-            Main.osdWindowManager.show(
-                -1,
+            // GNOME 47+ OSD API: show(icon, label, levels) takes a
+            // per-monitor levels map; showAll() is the no-level-bar
+            // variant for every monitor.
+            Main.osdWindowManager.showAll(
                 new Gio.ThemedIcon({ name: 'input-keyboard-symbolic' }),
-                `Nome - Onscreen Keyboard\n${OSK_BUILD_TAG}`,
-                null, null);
+                `Nome - Onscreen Keyboard\n${OSK_BUILD_TAG}`);
         } catch (e) {
             log(`gnome-osk: _showHelp osd failed: ${e}`);
         }
@@ -3194,6 +3279,7 @@ export default class OSKExtension extends Extension {
                 cfg.customization, cfg.userThemes);
             cfg.layout = LAYOUTS[cfg.layout] ? cfg.layout : DEFAULT_LAYOUT_KEY;
             cfg.predictionEnabled = cfg.predictionEnabled === true;
+            cfg.dwellTypingEnabled = cfg.dwellTypingEnabled === true;
             cfg.showOnStartup = cfg.showOnStartup !== false;
             this._config = cfg;
             const bytes = new TextEncoder().encode(
@@ -3761,6 +3847,8 @@ export default class OSKExtension extends Extension {
         }
         this._cancelAuthVisibilityRetry();
         _clearSource(this, '_predictorLoadId');
+        this._stopDwellPointerPoll();
+        this._uninstallFocusWindowTracker();
         this._uninstallModalRaiseHooks();
         this._leaveModalBridge('disable', false);
 
@@ -3839,6 +3927,11 @@ export default class OSKExtension extends Extension {
             // before the actors paint their last frame.
             try { keyboard._teardownRgbAnimation(); }
             catch (e) { log(`gnome-osk: rgb teardown failed: ${e}`); }
+            if (this._keyboardGrabChromeEventId) {
+                try { keyboard.disconnect(this._keyboardGrabChromeEventId); }
+                catch (_e) {}
+                this._keyboardGrabChromeEventId = 0;
+            }
             this._detachKeyboardFromShellLayer(keyboard);
             try { keyboard.destroy(); }
             catch (_e) {}
@@ -3866,6 +3959,244 @@ export default class OSKExtension extends Extension {
         this._virtualDevice = null;
     }
 
+    _installFocusWindowTracker() {
+        if (!global.display || this._focusWindowNotifyId)
+            return;
+        try {
+            this._focusWindowNotifyId = global.display.connect(
+                'notify::focus-window',
+                () => this._rememberFocusedWindow());
+            this._rememberFocusedWindow();
+        } catch (e) {
+            this._focusWindowNotifyId = 0;
+            log(`gnome-osk: focus-window tracker unavailable: ${e}`);
+        }
+    }
+
+    _uninstallFocusWindowTracker() {
+        if (this._focusWindowNotifyId && global.display) {
+            try { global.display.disconnect(this._focusWindowNotifyId); }
+            catch (_e) {}
+        }
+        this._focusWindowNotifyId = 0;
+        this._lastFocusedWindow = null;
+    }
+
+    _focusedWindow() {
+        try {
+            if (global.display && global.display.focus_window)
+                return global.display.focus_window;
+        } catch (_e) {}
+        try {
+            if (global.display && global.display.get_focus_window)
+                return global.display.get_focus_window();
+        } catch (_e) {}
+        return null;
+    }
+
+    _isUsableFocusWindow(win) {
+        if (!win)
+            return false;
+        try {
+            if (win.is_hidden && win.is_hidden())
+                return false;
+        } catch (_e) {}
+        try {
+            if (win.minimized)
+                return false;
+        } catch (_e) {}
+        try {
+            if (win.get_window_type) {
+                const type = win.get_window_type();
+                if (type === Meta.WindowType.DESKTOP
+                    || type === Meta.WindowType.DOCK)
+                    return false;
+            }
+        } catch (_e) {}
+        try {
+            if (win.get_compositor_private && !win.get_compositor_private())
+                return false;
+        } catch (_e) {}
+        return true;
+    }
+
+    _rememberFocusedWindow() {
+        const win = this._focusedWindow();
+        if (this._isUsableFocusWindow(win))
+            this._lastFocusedWindow = win;
+    }
+
+    _currentEventTimestamp() {
+        try {
+            if (global.get_current_time)
+                return global.get_current_time();
+        } catch (_e) {}
+        try {
+            if (Clutter.get_current_event) {
+                const event = Clutter.get_current_event();
+                if (event && event.get_time)
+                    return event.get_time();
+            }
+        } catch (_e) {}
+        return Math.floor(GLib.get_monotonic_time() / 1000);
+    }
+
+    _preserveFocusedWindowForKey() {
+        if (this._authSessionMode || this._isAnyModalActive(true))
+            return;
+
+        // App popups and inline rename fields can drop focus when the
+        // pointer lands on Shell chrome. Re-assert the last real app
+        // window immediately before sending the virtual key.
+        const focused = this._focusedWindow();
+        const target = this._isUsableFocusWindow(focused)
+            ? focused
+            : this._lastFocusedWindow;
+        if (!this._isUsableFocusWindow(target))
+            return;
+
+        this._lastFocusedWindow = target;
+        try {
+            if (target.activate)
+                target.activate(this._currentEventTimestamp());
+        } catch (_e) {}
+    }
+
+    _setDwellTypingEnabled(enabled, persist = false) {
+        this._dwellTypingEnabled = !this._authSessionMode && !!enabled;
+        if (persist) {
+            this._config = this._config || {};
+            this._config.dwellTypingEnabled = this._dwellTypingEnabled;
+            this._saveConfig();
+        }
+        this._syncDwellPointerPoll('dwell-toggle');
+    }
+
+    _syncDwellPointerPoll(_reason) {
+        const keyboard = this._keyboardOrNull('_syncDwellPointerPoll');
+        const shouldRun = !!this._dwellTypingEnabled
+            && !!keyboard
+            && !!keyboard.visible;
+        if (shouldRun)
+            this._startDwellPointerPoll();
+        else
+            this._stopDwellPointerPoll();
+    }
+
+    _startDwellPointerPoll() {
+        if (this._dwellPollId)
+            return;
+        this._dwellTarget = null;
+        this._dwellTargetStartUs = 0;
+        this._dwellPollId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT,
+            DWELL_TYPING_POLL_MS,
+            () => this._onDwellPointerPoll());
+    }
+
+    _stopDwellPointerPoll() {
+        _clearSource(this, '_dwellPollId');
+        this._dwellTarget = null;
+        this._dwellTargetStartUs = 0;
+        this._clearCapturedHover();
+    }
+
+    _readPointer() {
+        try {
+            const p = global.get_pointer();
+            if (p && p.length >= 2)
+                return p;
+        } catch (_e) {}
+        return null;
+    }
+
+    _onDwellPointerPoll() {
+        const keyboard = this._keyboardOrNull('_onDwellPointerPoll');
+        if (!this._dwellTypingEnabled || !keyboard || !keyboard.visible) {
+            this._dwellPollId = 0;
+            this._stopDwellPointerPoll();
+            return GLib.SOURCE_REMOVE;
+        }
+
+        const pointer = this._readPointer();
+        if (!pointer) {
+            this._dwellTarget = null;
+            this._dwellTargetStartUs = 0;
+            this._clearCapturedHover();
+            return GLib.SOURCE_CONTINUE;
+        }
+
+        const x = pointer[0];
+        const y = pointer[1];
+        const hoverEvent = this._syntheticPointerEvent(
+            Clutter.EventType.MOTION, x, y);
+        const target = this._dwellTargetForPoint(keyboard, x, y);
+        this._syncCapturedHoverTarget(target, hoverEvent);
+
+        if (!target) {
+            this._dwellTarget = null;
+            this._dwellTargetStartUs = 0;
+            return GLib.SOURCE_CONTINUE;
+        }
+
+        const now = GLib.get_monotonic_time();
+        if (target !== this._dwellTarget) {
+            this._dwellTarget = target;
+            this._dwellTargetStartUs = now;
+            return GLib.SOURCE_CONTINUE;
+        }
+
+        if (now - this._dwellTargetStartUs >= DWELL_TYPING_DELAY_US) {
+            this._dispatchDwellTarget(target, x, y);
+            this._dwellTargetStartUs = now;
+        }
+
+        return GLib.SOURCE_CONTINUE;
+    }
+
+    _dwellTargetForPoint(keyboard, x, y) {
+        if (!this._actorContainsStagePoint(keyboard, x, y))
+            return null;
+        const actor = this._findKeyboardActorAt(keyboard, x, y);
+        const handler = this._capturedPointerHandlerFor(actor);
+        if (!handler || !this._isDwellTypingTarget(handler))
+            return null;
+        return handler;
+    }
+
+    _isDwellTypingTarget(actor) {
+        const desc = this._actorDescriptor(actor);
+        return desc.includes('osk-key')
+            || desc.includes('oskkey')
+            || desc.includes('osk-prediction')
+            || desc.includes('oskpredictionbutton');
+    }
+
+    _syntheticPointerEvent(type, x, y) {
+        return {
+            type: () => type,
+            get_coords: () => [x, y],
+            get_button: () => 1,
+            get_state: () => 0,
+        };
+    }
+
+    _dispatchDwellTarget(target, x, y) {
+        if (!target || typeof target.handleCapturedPointerEvent !== 'function')
+            return;
+        this._reentrantSyntheticDispatch = true;
+        try {
+            target.handleCapturedPointerEvent(this._syntheticPointerEvent(
+                Clutter.EventType.BUTTON_PRESS, x, y));
+            target.handleCapturedPointerEvent(this._syntheticPointerEvent(
+                Clutter.EventType.BUTTON_RELEASE, x, y));
+        } catch (e) {
+            log(`gnome-osk: dwell key dispatch failed: ${e}`);
+        } finally {
+            this._reentrantSyntheticDispatch = false;
+        }
+    }
+
     _onSessionModeUpdated() {
         const wasAuth = !!this._authSessionMode;
         const keyboard = this._keyboardOrNull('_onSessionModeUpdated');
@@ -3878,6 +4209,7 @@ export default class OSKExtension extends Extension {
 
         if (!wasAuth && this._authSessionMode) {
             this._uninstallShellKeyboardEventBridge();
+            this._stopDwellPointerPoll();
             this._installModalAwareInput();
             this._installModalRaiseHooks();
             this._preAuthVisible = previousVisible;
@@ -3886,7 +4218,9 @@ export default class OSKExtension extends Extension {
             return;
         }
         if (wasAuth && !this._authSessionMode) {
-            this._uninstallModalAwareInput();
+            this._dwellTypingEnabled = !!(this._config
+                && this._config.dwellTypingEnabled);
+            this._installModalAwareInput();
             this._installShellKeyboardEventBridge();
             this._cancelAuthVisibilityRetry();
             this._leaveModalBridge('session-leave-auth', false);
@@ -3895,6 +4229,7 @@ export default class OSKExtension extends Extension {
             this._preAuthVisible = undefined;
             this._setVisible(restore !== undefined
                 ? !!restore : this._config.showOnStartup !== false);
+            this._syncDwellPointerPoll('session-leave-auth');
         }
     }
 
@@ -3914,6 +4249,7 @@ export default class OSKExtension extends Extension {
         } catch (e) {
             this._keyboard = null;
             this._modalPointerTarget = null;
+            this._stopDwellPointerPoll();
             this._cancelAuthVisibilityRetry();
             log(`gnome-osk: dropped disposed keyboard actor (${reason}): ${e}`);
             return null;
@@ -3928,7 +4264,12 @@ export default class OSKExtension extends Extension {
         try { wasVisible = !!keyboard.visible; } catch (_e) {}
         if (visible && keyboard.ensureOnScreen)
             keyboard.ensureOnScreen();
+        if (visible)
+            this._installModalAwareInput();
+        else if (!this._authSessionMode)
+            this._uninstallModalAwareInput();
         keyboard.visible = visible;
+        this._syncDwellPointerPoll('_setVisible');
         if (visible && !wasVisible) {
             keyboard._visibleEffectsPaused = false;
             if (keyboard._queuePostLayoutRefresh)
@@ -3942,13 +4283,17 @@ export default class OSKExtension extends Extension {
         const lm = Main.layoutManager;
         if (!lm) return false;
 
+        // GNOME 51+: live in the input panel group next to Shell's own
+        // OSK, so Shell modal / popup-menu grabs can't swallow our taps.
+        // GNOME 50: top chrome, as before.
+        const inputPanel = _inputPanelGroup();
         const parent = keyboard.get_parent ? keyboard.get_parent() : null;
-        if (parent && !this._keyboardInModalLayer) {
-            const chromeParent = lm.uiGroup || Main.uiGroup || null;
-            if (!force || parent === chromeParent) {
-                this._raiseKeyboardToTop(reason || 'already-in-chrome');
-                return true;
-            }
+        const chromeParent = inputPanel || lm.uiGroup || Main.uiGroup || null;
+        if (parent && parent === chromeParent
+            && !this._keyboardInModalLayer
+            && !this._keyboardInAuthHost) {
+            this._raiseKeyboardToTop(reason || 'already-in-chrome');
+            return true;
         }
         const [stageX, stageY] = this._actorStagePosition(keyboard);
 
@@ -3957,20 +4302,33 @@ export default class OSKExtension extends Extension {
                 keyboard._destroyBackgroundLayer();
         } catch (_e) {}
 
-        if (parent) {
-            try { parent.remove_child(keyboard); } catch (_e) {}
-        }
+        this._detachKeyboardFromParent(keyboard);
 
         try {
-            const addChromeFn = typeof lm.addTopChrome === 'function'
-                ? lm.addTopChrome.bind(lm)
-                : lm.addChrome.bind(lm);
-            addChromeFn(keyboard, {
+            const chromeParams = {
                 affectsStruts: false,
                 trackFullscreen: false,
-            });
+            };
+            if (inputPanel) {
+                inputPanel.add_child(keyboard);
+                this._keyboardInInputPanel = true;
+                // Same layout-manager bookkeeping addChrome() gives a
+                // direct uiGroup child.
+                if (typeof lm.trackChrome === 'function') {
+                    try { lm.trackChrome(keyboard, chromeParams); }
+                    catch (e) {
+                        log(`gnome-osk: trackChrome failed (${reason}): ${e}`);
+                    }
+                }
+            } else {
+                const addChromeFn = typeof lm.addTopChrome === 'function'
+                    ? lm.addTopChrome.bind(lm)
+                    : lm.addChrome.bind(lm);
+                addChromeFn(keyboard, chromeParams);
+            }
             this._setActorStagePosition(keyboard, stageX, stageY);
             this._keyboardInModalLayer = false;
+            this._keyboardInAuthHost = false;
             this._disconnectKeyboardModalHost();
             this._keyboardModalHost = null;
             this._raiseKeyboardToTop(reason || 'add-chrome');
@@ -4080,13 +4438,7 @@ export default class OSKExtension extends Extension {
             if (keyboard._destroyBackgroundLayer)
                 keyboard._destroyBackgroundLayer();
         } catch (_e) {}
-        try { Main.layoutManager.removeChrome(keyboard); }
-        catch (_e) {}
-        const afterChromeParent = keyboard.get_parent
-            ? keyboard.get_parent() : null;
-        if (afterChromeParent && afterChromeParent !== host) {
-            try { afterChromeParent.remove_child(keyboard); } catch (_e) {}
-        }
+        this._detachKeyboardFromParent(keyboard);
 
         try {
             host.add_child(keyboard);
@@ -4168,6 +4520,7 @@ export default class OSKExtension extends Extension {
         const parent = keyboard.get_parent ? keyboard.get_parent() : null;
         if (parent === host) {
             this._keyboardInModalLayer = true;
+            this._keyboardInAuthHost = false;
             this._connectKeyboardModalHost(host);
             this._keyboardModalHost = host;
             this._raiseKeyboardToTop(reason || 'modal-layer-raise');
@@ -4180,19 +4533,13 @@ export default class OSKExtension extends Extension {
                 keyboard._destroyBackgroundLayer();
         } catch (_e) {}
 
-        try { Main.layoutManager.removeChrome(keyboard); }
-        catch (_e) {}
-
-        const afterRemoveParent = keyboard.get_parent
-            ? keyboard.get_parent() : null;
-        if (afterRemoveParent && afterRemoveParent !== host) {
-            try { afterRemoveParent.remove_child(keyboard); } catch (_e) {}
-        }
+        this._detachKeyboardFromParent(keyboard);
 
         try {
             host.add_child(keyboard);
             this._setActorStagePosition(keyboard, stageX, stageY);
             this._keyboardInModalLayer = true;
+            this._keyboardInAuthHost = false;
             this._connectKeyboardModalHost(host);
             this._keyboardModalHost = host;
             this._raiseKeyboardToTop(reason || 'modal-layer');
@@ -4213,18 +4560,36 @@ export default class OSKExtension extends Extension {
         this._addKeyboardToChrome(reason || 'restore-from-modal-layer');
     }
 
+    // Remove the keyboard from whichever Shell layer hosts it and undo
+    // the layout-manager tracking that came with it.  removeChrome()
+    // only applies to direct uiGroup children; the input panel group
+    // (GNOME 51+) and the modal / auth hosts are detached by hand.
+    _detachKeyboardFromParent(keyboard) {
+        if (!keyboard) return;
+        const lm = Main.layoutManager;
+        const parent = keyboard.get_parent ? keyboard.get_parent() : null;
+        const uiGroup = (lm && lm.uiGroup) || Main.uiGroup || null;
+        if (lm && parent && parent === uiGroup) {
+            try { lm.removeChrome(keyboard); }
+            catch (_e) {}
+        }
+        const leftover = keyboard.get_parent ? keyboard.get_parent() : null;
+        if (leftover) {
+            try { leftover.remove_child(keyboard); } catch (_e) {}
+        }
+        if (lm && typeof lm.untrackChrome === 'function') {
+            try { lm.untrackChrome(keyboard); } catch (_e) {}
+        }
+        this._keyboardInInputPanel = false;
+    }
+
     _detachKeyboardFromShellLayer(keyboard) {
         if (!keyboard) return;
         try {
             if (keyboard._destroyBackgroundLayer)
                 keyboard._destroyBackgroundLayer();
         } catch (_e) {}
-        try { Main.layoutManager.removeChrome(keyboard); }
-        catch (_e) {}
-        const parent = keyboard.get_parent ? keyboard.get_parent() : null;
-        if (parent) {
-            try { parent.remove_child(keyboard); } catch (_e) {}
-        }
+        this._detachKeyboardFromParent(keyboard);
         this._keyboardInModalLayer = false;
         this._keyboardInAuthHost = false;
         this._disconnectKeyboardModalHost();
@@ -4533,7 +4898,12 @@ export default class OSKExtension extends Extension {
 
         const manager = Main.keyboard;
         if (!manager || typeof manager.maybeHandleEvent !== 'function') {
-            log('gnome-osk: Shell keyboard event bridge unavailable');
+            // GNOME 51 removed maybeHandleEvent(); Shell modals are
+            // covered by the input panel grab chrome instead (see
+            // _onKeyboardGrabChromeEvent).
+            log(_inputPanelGroup()
+                ? 'gnome-osk: Shell modal taps handled via input panel grab chrome'
+                : 'gnome-osk: Shell keyboard event bridge unavailable');
             return false;
         }
 
@@ -4616,8 +4986,6 @@ export default class OSKExtension extends Extension {
         const type = event.type();
         if (!this._isPointerLikeEvent(type))
             return false;
-        if (!this._shouldUseShellKeyboardEventBridge())
-            return false;
 
         const keyboard = this._keyboardOrNull('_maybeHandleShellKeyboardEvent');
         if (!keyboard || !keyboard.visible) {
@@ -4633,8 +5001,8 @@ export default class OSKExtension extends Extension {
             return false;
         }
 
-        if (!this._modalPointerTarget
-            && !this._actorContainsStagePoint(keyboard, x, y)) {
+        const insideKeyboard = this._actorContainsStagePoint(keyboard, x, y);
+        if (!this._modalPointerTarget && !insideKeyboard) {
             this._clearCapturedHover();
             return false;
         }
@@ -4663,12 +5031,21 @@ export default class OSKExtension extends Extension {
 
         this._syncCapturedHoverTarget(hitHandler, event);
 
-        if (!this._modalPointerTarget && endsPointerSequence)
+        // Treat Nome itself as a Shell keyboard surface even when the
+        // active grab belongs to an app popup rather than a Shell modal.
+        const bridgeActive = !!this._modalPointerTarget
+            || !!hitHandler
+            || insideKeyboard
+            || this._shouldUseShellKeyboardEventBridge();
+        if (!bridgeActive)
             return false;
+
+        if (!this._modalPointerTarget && endsPointerSequence)
+            return insideKeyboard;
 
         if (!this._modalPointerTarget && updatesPointerSequence
             && this._eventHasButtonOrTouchGrab(event, type)) {
-            return false;
+            return insideKeyboard;
         }
 
         let target = this._modalPointerTarget || null;
@@ -4679,9 +5056,9 @@ export default class OSKExtension extends Extension {
         }
 
         if (!target || !this._isKeyboardDescendant(target))
-            return false;
+            return insideKeyboard;
         if (typeof target.handleCapturedPointerEvent !== 'function')
-            return false;
+            return insideKeyboard;
 
         this._reentrantSyntheticDispatch = true;
         let result = Clutter.EVENT_STOP;
@@ -4743,13 +5120,15 @@ export default class OSKExtension extends Extension {
         return !!(state & buttonMask);
     }
 
-    // ---- modal-aware input ---------------------------------------
+    // ---- pointer bridge ------------------------------------------
     //
-    // Auth surfaces can use stricter grabs than ordinary desktop
-    // popups. Normal desktop modals use Shell's built-in
-    // Main.keyboard.maybeHandleEvent() hook, installed above, so the
-    // stage-level capture bridge remains only for GDM/unlock fallback
-    // behavior.
+    // Capture-stage handling is installed in all sessions but only
+    // stops pointer events that land on Nome. That keeps app popups
+    // and inline rename editors from receiving an OSK tap as an
+    // outside click, while leaving the rest of the desktop alone.
+    // The Main.keyboard hook remains as a fallback for Shell builds
+    // that route grabbed popup input through the built-in keyboard
+    // manager before normal captured-event delivery.
     //
     // Key events still go through Clutter.VirtualInputDevice at Mutter
     // input-subsystem level.  The OSK actors do not take key focus, so
@@ -4766,6 +5145,43 @@ export default class OSKExtension extends Extension {
         if (this._stageCapturedEventId) {
             global.stage.disconnect(this._stageCapturedEventId);
             this._stageCapturedEventId = 0;
+        }
+    }
+
+    // GNOME 51+ replacement for the Main.keyboard.maybeHandleEvent()
+    // hook.  Nome lives in Mutter's input panel group, the stage's
+    // "grab chrome": while a Shell modal dialog or popup menu holds the
+    // pointer grab, Mutter roots the event chain for taps on Nome at
+    // that group instead of at the stage, so neither the stage-level
+    // handler above nor the modal sees them.  Route those taps through
+    // the dispatcher the GNOME 50 bridge used, so keys, hover and touch
+    // behave the same as they did under Shell modals.
+    //
+    // Only acts while a grab owned by something outside Nome is active.
+    // With no grab, or a grab on the stage (GDM greeter, overview) or on
+    // uiGroup (lock screen), events already pass the stage handler or
+    // reach Nome's own key handlers the normal way.
+    _onKeyboardGrabChromeEvent(event) {
+        if (this._reentrantSyntheticDispatch || !this._keyboardInInputPanel)
+            return Clutter.EVENT_PROPAGATE;
+        const keyboard = this._keyboardOrNull('_onKeyboardGrabChromeEvent');
+        if (!keyboard)
+            return Clutter.EVENT_PROPAGATE;
+        const grab = this._stageGrabActor();
+        if (!grab || grab === global.stage)
+            return Clutter.EVENT_PROPAGATE;
+        try {
+            if (grab.contains(keyboard) || this._isKeyboardDescendant(grab))
+                return Clutter.EVENT_PROPAGATE;
+        } catch (_e) {
+            return Clutter.EVENT_PROPAGATE;
+        }
+        try {
+            return this._maybeHandleShellKeyboardEvent(event)
+                ? Clutter.EVENT_STOP : Clutter.EVENT_PROPAGATE;
+        } catch (e) {
+            log(`gnome-osk: grab-chrome event bridge failed: ${e}`);
+            return Clutter.EVENT_PROPAGATE;
         }
     }
 
@@ -4809,8 +5225,9 @@ export default class OSKExtension extends Extension {
             || type === Clutter.EventType.TOUCH_END
             || type === Clutter.EventType.TOUCH_CANCEL;
 
+        const insideKeyboard = this._actorContainsStagePoint(keyboard, x, y);
         const hasActiveKeyboardPointer = !!this._modalPointerTarget
-            || this._actorContainsStagePoint(keyboard, x, y);
+            || insideKeyboard;
         if (!hasActiveKeyboardPointer && !this._modalBridgeGrab) {
             this._clearCapturedHover();
             return Clutter.EVENT_PROPAGATE;
