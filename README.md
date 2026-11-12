@@ -40,7 +40,7 @@ https://github.com/user-attachments/assets/c3870e71-adc1-4f18-a6d4-455cd7c6ba5c
 - Does not steal focus when you click a key.
 - Sends real key events through Mutter's virtual keyboard device.
 - Works with normal apps and terminals.
-- Supports mouse and touch input.
+- Supports mouse, stylus, and finger touch on touchscreens. Everything works by finger, including moving and resizing the keyboard, the menus, and the Customize window.
 - Floating keyboard window with title bar.
 - Drag to move the keyboard.
 - Resize from the bottom-right grip.
@@ -53,6 +53,7 @@ https://github.com/user-attachments/assets/c3870e71-adc1-4f18-a6d4-455cd7c6ba5c
 - Panel indicator for quick access.
 - Left-click the panel icon to show or hide the keyboard.
 - Right-click the panel icon to open the options menu.
+- On a touchscreen, tap the panel icon to show or hide the keyboard, and hold your finger on it to open the options menu.
 - Optional hover-to-open panel menu for users who find right-clicking difficult.
 
 ### Layouts
@@ -70,6 +71,7 @@ https://github.com/user-attachments/assets/c3870e71-adc1-4f18-a6d4-455cd7c6ba5c
 
 - Sticky modifier support for Shift, Ctrl, Alt, and Super/Meta.
 - Right-click a modifier to cycle through off, armed, and locked states.
+- On a touchscreen, hold your finger on a modifier to cycle it the same way. A quick tap sends the key itself.
 - Armed modifiers are consumed after the next keypress.
 - Locked modifiers stay active until turned off.
 - Left-clicking a modifier can send the modifier key itself.
