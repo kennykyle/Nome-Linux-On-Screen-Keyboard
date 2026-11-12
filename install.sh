@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Nome - Onscreen Keyboard -- installer (GNOME Shell extension for GNOME 50).
+# Nome - Onscreen Keyboard -- installer (GNOME Shell extension for GNOME 50 and 51).
 #
 # Usage:
 #   ./install.sh                 # install and enable the extension
@@ -290,8 +290,8 @@ cmd_check() {
         local v
         v="$(gnome-shell --version 2>/dev/null || echo unknown)"
         ok "GNOME Shell: $v"
-        if [[ "$v" != *" 50"* ]] && [[ "$v" != *" 50." ]]; then
-            warn "  This extension declares shell-version 50; other"
+        if [[ "$v" != *" 50"* ]] && [[ "$v" != *" 51"* ]]; then
+            warn "  This extension declares shell-version 50 and 51; other"
             warn "  versions may refuse to load it."
         fi
     else
@@ -427,7 +427,7 @@ cmd_install() {
 
     if [[ "${XDG_SESSION_TYPE:-}" != "wayland" ]]; then
         warn "Current session is '${XDG_SESSION_TYPE:-unset}', not Wayland."
-        warn "GNOME 50 is Wayland-only; the extension will install but"
+        warn "GNOME 50+ is Wayland-only; the extension will install but"
         warn "you need to log into a Wayland session to use it."
     fi
 

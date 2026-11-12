@@ -2,7 +2,7 @@
 
 https://github.com/user-attachments/assets/9b4f16ad-1aff-4c84-a0c1-0ec29a566539
 
-Nome is a mouse-driven virtual on-screen keyboard for GNOME Shell 50 on Wayland. It runs inside GNOME Shell instead of as a normal app, which lets it stay above other windows, avoid stealing focus from the text field you are typing into, and send real keyboard events through Mutter's virtual input device. It is built for accessibility-first desktop use: mouse, touch, limited-movement workflows, terminals, login prompts, and any situation where GNOME's built-in keyboard is not enough.
+Nome is a mouse-driven virtual on-screen keyboard for GNOME Shell 50 and 51 on Wayland. It runs inside GNOME Shell instead of as a normal app, which lets it stay above other windows, avoid stealing focus from the text field you are typing into, and send real keyboard events through Mutter's virtual input device. It is built for accessibility-first desktop use: mouse, touch, limited-movement workflows, terminals, login prompts, and any situation where GNOME's built-in keyboard is not enough.
 
 ## Why This Exists
 
@@ -195,13 +195,15 @@ https://github.com/user-attachments/assets/cb7775f3-d6f2-49b9-8d80-c76e85f1c8d0
 
 ### Required
 
-- GNOME Shell 50.
+- GNOME Shell 50 or 51.
 - A Wayland GNOME session.
 - Bash.
 - `gnome-extensions` command-line tool.
-- Standard GNOME Shell libraries available in GNOME 50.
+- Standard GNOME Shell libraries available in GNOME 50 / 51.
 
-The extension declares `"shell-version": ["50"]` in `metadata.json`. Other GNOME Shell versions may refuse to load it.
+The extension declares `"shell-version": ["50", "51"]` in `metadata.json`. Other GNOME Shell versions may refuse to load it.
+
+On GNOME 51 the keyboard lives in Mutter's input panel group (next to GNOME's own on-screen keyboard), which keeps it clickable while Shell dialogs such as password prompts are open.
 
 ### Recommended
 
