@@ -37,6 +37,9 @@ import {
     RGB_SHADOW_ALPHA_COLOR, RGB_COLOR_RING_OPACITY,
     _haloBlendFeather,
 } from './rgbEffects.js';
+import {
+    eventButton, isOtherFinger, isTouchEventType, longPressMs, touchSlot,
+} from './modalAuth.js';
 export { RGB_GLOW_SIZE_MAX, RGB_SPREAD_SIZE_MAX } from './rgbEffects.js';
 
 const REPEAT_DELAY_MS = 450;
@@ -135,6 +138,21 @@ function _setActorGeometryIfChanged(actor, x, y, w, h) {
     const moved = _setActorPositionIfChanged(actor, x, y);
     const sized = _setActorSizeIfChanged(actor, w, h);
     return moved || sized;
+}
+
+// True when the stage coordinates of `event` fall inside `actor`.  Errs
+// on the side of "inside" if the geometry cannot be read.
+function _eventInsideActor(actor, event) {
+    try {
+        const [x, y] = event.get_coords();
+        const [ax, ay] = actor.get_transformed_position();
+        const [w, h] = actor.get_transformed_size();
+        if (!(w > 0) || !(h > 0))
+            return true;
+        return x >= ax && x <= ax + w && y >= ay && y <= ay + h;
+    } catch (_e) {
+        return true;
+    }
 }
 
 // Signal/timer tracking helpers live in lifecycle.js.
@@ -257,6 +275,11 @@ class OSKKey extends St.Button {
         this._pressed = false;
         this._initialDelayId = 0;
         this._repeatId = 0;
+        // Finger currently holding this key (see _onTouchEvent).
+        this._touchActive = false;
+        this._touchSlot = null;
+        this._modifierHoldId = 0;
+        this._modifierLongPressed = false;
         this._lifecycle = new OskLifecycleTracker(this);
         // Stable index in the keyboard's flat key sequence, assigned
         // by OSKKeyboard after _buildRows.  Reactive mode reads it to
@@ -272,6 +295,9 @@ class OSKKey extends St.Button {
         // separate press/release for hold-to-repeat.  Connect raw events.
         this.connect('button-press-event', this._onPress.bind(this));
         this.connect('button-release-event', this._onRelease.bind(this));
+        // A finger on a touchscreen sends touch events, not button
+        // events (a stylus already sends button events).
+        this.connect('touch-event', this._onTouchEvent.bind(this));
         this.connect('leave-event', this._onLeave.bind(this));
         // notify::hover is the cleanest way to get "mouse entered" /
         // "mouse left" callbacks -- works with track_hover: true above.
@@ -482,7 +508,8 @@ class OSKKey extends St.Button {
         // the legacy off/armed/locked toggle so users can still set
         // up sticky-key combos.  For non-modifier keys the button is
         // ignored -- left and right both just send the keycode.
-        const button = (event && event.get_button) ? event.get_button() : 1;
+        // A finger counts as the left button.
+        const button = eventButton(event);
         this._lastButton = button;
         this._pressed = true;
         // Let the keyboard's RGB "reactive" mode kick off the per-key
@@ -520,17 +547,82 @@ class OSKKey extends St.Button {
         // by the grab machinery.  The extension-level capture handler
         // calls this method directly after hit-testing the OSK key.
         const type = event.type();
-        if (type === Clutter.EventType.BUTTON_PRESS ||
-            type === Clutter.EventType.TOUCH_BEGIN) {
+        if (isTouchEventType(type))
+            return this._onTouchEvent(this, event);
+        if (type === Clutter.EventType.BUTTON_PRESS)
             return this._onPress(this, event);
-        }
-        if (type === Clutter.EventType.BUTTON_RELEASE ||
-            type === Clutter.EventType.TOUCH_END ||
-            type === Clutter.EventType.TOUCH_CANCEL) {
+        if (type === Clutter.EventType.BUTTON_RELEASE)
             return this._onRelease(this, event);
-        }
         if (type === Clutter.EventType.LEAVE) {
             return this._onLeave();
+        }
+        return Clutter.EVENT_STOP;
+    }
+
+    // A finger works like a left click: the key fires when the finger
+    // lands (so hold-to-repeat works) and stops when it lifts.  Only the
+    // finger that pressed the key releases it, and sliding off the key
+    // stops repeating, the same as moving the mouse off a held key.
+    //
+    // Modifier keys (Shift, Ctrl, Alt, Super) are different: a quick tap
+    // sends the modifier like a left click, and holding the finger arms
+    // or locks it for combos like a right click, which a finger can't do.
+    _onTouchEvent(_actor, event) {
+        const type = event.type();
+        if (type === Clutter.EventType.TOUCH_BEGIN) {
+            this._touchActive = true;
+            this._touchSlot = touchSlot(event);
+            if (this._spec.modifier)
+                return this._beginModifierTouch();
+            return this._onPress(this, event);
+        }
+        if (type === Clutter.EventType.TOUCH_UPDATE) {
+            if (this._touchActive && this._pressed
+                && !isOtherFinger(event, this._touchSlot)
+                && !_eventInsideActor(this, event)) {
+                this._pressed = false;
+                this._stopTimers();
+                this._updateStyle();
+            }
+            return Clutter.EVENT_STOP;
+        }
+        if (type === Clutter.EventType.TOUCH_END
+            || type === Clutter.EventType.TOUCH_CANCEL) {
+            if (this._touchActive && isOtherFinger(event, this._touchSlot))
+                return Clutter.EVENT_STOP;
+            if (this._spec.modifier)
+                return this._endModifierTouch(type === Clutter.EventType.TOUCH_END);
+            return this._onRelease();
+        }
+        return Clutter.EVENT_STOP;
+    }
+
+    _beginModifierTouch() {
+        this._pressed = true;
+        this._modifierLongPressed = false;
+        this._updateStyle();
+        this._lifecycle.timeoutAdd(
+            '_modifierHoldId',
+            GLib.PRIORITY_DEFAULT, longPressMs(),
+            () => {
+                this._modifierLongPressed = true;
+                // Right-click semantics: off -> armed -> locked -> off.
+                this._keyboard.onKeyPress(this._spec, false, 3);
+                return GLib.SOURCE_REMOVE;
+            });
+        return Clutter.EVENT_STOP;
+    }
+
+    _endModifierTouch(completed) {
+        const wasLongPress = this._modifierLongPressed;
+        const stillPressed = this._pressed;
+        this._modifierLongPressed = false;
+        this._onRelease();
+        // A quick tap that stayed on the key: left-click semantics.
+        if (completed && !wasLongPress && stillPressed) {
+            if (this._keyboard._onKeyPressedForRgb)
+                this._keyboard._onKeyPressedForRgb(this);
+            this._keyboard.onKeyPress(this._spec, false, 1);
         }
         return Clutter.EVENT_STOP;
     }
@@ -553,6 +645,8 @@ class OSKKey extends St.Button {
 
     _onRelease() {
         this._pressed = false;
+        this._touchActive = false;
+        this._touchSlot = null;
         this._stopTimers();
         this._updateStyle();
         return Clutter.EVENT_STOP;
@@ -594,9 +688,11 @@ class OSKKey extends St.Button {
         if (this._lifecycle) {
             this._lifecycle.clearSource('_initialDelayId');
             this._lifecycle.clearSource('_repeatId');
+            this._lifecycle.clearSource('_modifierHoldId');
         } else {
             _clearSource(this, '_initialDelayId');
             _clearSource(this, '_repeatId');
+            _clearSource(this, '_modifierHoldId');
         }
     }
 });
@@ -634,6 +730,10 @@ const OSKTitleBar = GObject.registerClass({
         this._pendingDragY = 0;
         this._dragApplyId = 0;
         this._dragPollId = 0;
+        // A drag belongs to the mouse/stylus or to one finger; events
+        // from the other input (or another finger) don't move it.
+        this._dragByTouch = false;
+        this._dragTouchSlot = null;
         this._lifecycle = new OskLifecycleTracker(this);
         this._stageSignals = new OskLifecycleTracker();
         this._stageTrackingActive = false;
@@ -655,10 +755,12 @@ const OSKTitleBar = GObject.registerClass({
         label.set_style(keyboard._styles.titleLabel);
         label.connect('button-press-event', this._onDragStart.bind(this));
         label.connect('motion-event',       this._onDragMotion.bind(this));
-        label.connect('button-release-event', this._onDragEnd.bind(this));
+        label.connect('button-release-event', this._onDragRelease.bind(this));
+        label.connect('touch-event', this._onTouchEvent.bind(this));
         this.connect('button-press-event', this._onDragStart.bind(this));
         this.connect('motion-event',       this._onDragMotion.bind(this));
-        this.connect('button-release-event', this._onDragEnd.bind(this));
+        this.connect('button-release-event', this._onDragRelease.bind(this));
+        this.connect('touch-event', this._onTouchEvent.bind(this));
         this.connect('destroy', () => {
             this._lifecycle.clearSource('_dragApplyId');
             this._disconnectStageTracking();
@@ -850,8 +952,11 @@ const OSKTitleBar = GObject.registerClass({
         if (endsPointerSequence) {
             const pressed = this._capturedTitleButton;
             this._capturedTitleButton = null;
-            if (this._dragStartX !== null)
-                return this._onDragEnd(this, event);
+            if (this._dragStartX !== null) {
+                if (!this._isDragEvent(event))
+                    return Clutter.EVENT_STOP;
+                return this._onDragEnd();
+            }
             if (type !== Clutter.EventType.TOUCH_CANCEL) {
                 if (pressed === 'min' && overMin)
                     this.emit('minimize-requested');
@@ -883,9 +988,18 @@ const OSKTitleBar = GObject.registerClass({
     }
 
     _onDragStart(_actor, event) {
-        if (this._dragStartX !== null) return Clutter.EVENT_STOP;
-        if (this._dragLocked) return Clutter.EVENT_PROPAGATE;
         const type = event.type ? event.type() : null;
+        if (this._dragStartX !== null) {
+            // A second finger mid-drag is ignored.  Any other new press
+            // means the old drag lost its release, so end it first.
+            if (this._dragByTouch && isTouchEventType(type)
+                && isOtherFinger(event, this._dragTouchSlot))
+                return Clutter.EVENT_STOP;
+            if (!this._dragByTouch && !isTouchEventType(type))
+                return Clutter.EVENT_STOP;
+            this._onDragEnd();
+        }
+        if (this._dragLocked) return Clutter.EVENT_PROPAGATE;
         if (type === Clutter.EventType.BUTTON_PRESS
             && event.get_button && event.get_button() !== 1)
             return Clutter.EVENT_PROPAGATE;
@@ -905,8 +1019,16 @@ const OSKTitleBar = GObject.registerClass({
         this._dragOriginY = kbd.get_y();
         this._pendingDragX = this._dragOriginX;
         this._pendingDragY = this._dragOriginY;
+        this._dragByTouch = isTouchEventType(type);
+        this._dragTouchSlot = this._dragByTouch ? touchSlot(event) : null;
         if (this._keyboard && this._keyboard._beginInteractiveMotion)
             this._keyboard._beginInteractiveMotion('drag');
+        this._connectStageTracking();
+        // A finger drag follows its own touch events: Clutter keeps
+        // sending them to the title bar, and the mouse pointer (which
+        // the poll below reads) does not move with the finger.
+        if (this._dragByTouch)
+            return Clutter.EVENT_STOP;
         try {
             if (global.stage.grab) {
                 this._dragGrab = global.stage.grab(this);
@@ -914,13 +1036,42 @@ const OSKTitleBar = GObject.registerClass({
         } catch (_e) {
             this._dragGrab = null;
         }
-        this._connectStageTracking();
         this._startPointerPoll();
         return Clutter.EVENT_STOP;
     }
 
+    // Whether `event` comes from the input that owns the current drag:
+    // the same finger for a touch drag, the mouse/stylus otherwise.
+    _isDragEvent(event) {
+        let type = null;
+        try { type = event.type(); } catch (_e) { return false; }
+        if (isTouchEventType(type) !== this._dragByTouch)
+            return false;
+        return !isOtherFinger(event, this._dragTouchSlot);
+    }
+
+    _onTouchEvent(_actor, event) {
+        const type = event.type();
+        if (type === Clutter.EventType.TOUCH_BEGIN)
+            return this._onDragStart(this, event);
+        if (this._dragStartX === null || !this._isDragEvent(event))
+            return Clutter.EVENT_PROPAGATE;
+        if (type === Clutter.EventType.TOUCH_UPDATE)
+            return this._onDragMotion(this, event);
+        if (type === Clutter.EventType.TOUCH_END)
+            this._onDragMotion(this, event);
+        return this._onDragEnd();
+    }
+
+    _onDragRelease(_actor, event) {
+        if (this._dragStartX === null || !this._isDragEvent(event))
+            return Clutter.EVENT_PROPAGATE;
+        return this._onDragEnd();
+    }
+
     _onDragMotion(_actor, event) {
         if (this._dragStartX === null) return Clutter.EVENT_PROPAGATE;
+        if (!this._isDragEvent(event)) return Clutter.EVENT_PROPAGATE;
         let x, y;
         try {
             [x, y] = event.get_coords();
@@ -967,6 +1118,8 @@ const OSKTitleBar = GObject.registerClass({
         this._applyPendingDragPosition();
         this._dragStartX = null;
         this._dragStartY = null;
+        this._dragByTouch = false;
+        this._dragTouchSlot = null;
         if (this._dragGrab) {
             try { this._dragGrab.dismiss(); } catch (_e) { }
             this._dragGrab = null;
@@ -1002,15 +1155,25 @@ const OSKTitleBar = GObject.registerClass({
     _onStageCapturedEvent(event) {
         if (this._dragStartX === null) return Clutter.EVENT_PROPAGATE;
         const type = event.type();
+        // Touch slots are reused, so a new finger with this drag's slot
+        // means its lift never reached us.
+        if (type === Clutter.EventType.TOUCH_BEGIN) {
+            if (this._isDragEvent(event))
+                this._onDragEnd();
+            return Clutter.EVENT_PROPAGATE;
+        }
         if (type === Clutter.EventType.MOTION
             || type === Clutter.EventType.TOUCH_UPDATE) {
+            if (!this._isDragEvent(event)) return Clutter.EVENT_PROPAGATE;
             this._onDragMotion(this, event);
             return Clutter.EVENT_STOP;
         }
         if (type === Clutter.EventType.BUTTON_RELEASE
             || type === Clutter.EventType.TOUCH_END
             || type === Clutter.EventType.TOUCH_CANCEL) {
-            this._onDragMotion(this, event);
+            if (!this._isDragEvent(event)) return Clutter.EVENT_PROPAGATE;
+            if (type !== Clutter.EventType.TOUCH_CANCEL)
+                this._onDragMotion(this, event);
             this._onDragEnd();
             return Clutter.EVENT_STOP;
         }
@@ -1107,6 +1270,9 @@ class OSKResizeGrip extends St.Button {
         this._resizePollId = 0;
         this._sawButtonDown = false;
         this._pressTimeUs = 0;
+        // A resize belongs to the mouse/stylus or to one finger.
+        this._resizeByTouch = false;
+        this._resizeTouchSlot = null;
         this._lifecycle = new OskLifecycleTracker(this);
         this._stageSignals = new OskLifecycleTracker();
         this._stageTrackingActive = false;
@@ -1118,6 +1284,7 @@ class OSKResizeGrip extends St.Button {
 
         this.connect('button-press-event', this._onPress.bind(this));
         this.connect('motion-event', this._onMotion.bind(this));
+        this.connect('touch-event', this._onTouchEvent.bind(this));
         this.connect('destroy', () => {
             this._disconnectStageTracking();
             this._stopPointerPoll();
@@ -1162,7 +1329,16 @@ class OSKResizeGrip extends St.Button {
     }
 
     beginResizeFromEvent(event) {
-        if (event.get_button && event.get_button() !== 1)
+        if (this._startX !== null) {
+            // A second finger on the grip mid-resize is ignored.  Any
+            // other new press means the old resize lost its release, so
+            // finish it before starting again.
+            if (this._resizeByTouch && isTouchEventType(event.type())
+                && isOtherFinger(event, this._resizeTouchSlot))
+                return Clutter.EVENT_STOP;
+            this._finishResize();
+        }
+        if (eventButton(event) !== 1)
             return Clutter.EVENT_PROPAGATE;
         const [x, y] = event.get_coords();
         if (this._keyboard && this._keyboard.ensureOnScreen)
@@ -1177,19 +1353,51 @@ class OSKResizeGrip extends St.Button {
             ? this._keyboard.height : this._keyboard.get_height());
         this._pendingW = this._origW;
         this._pendingH = this._origH;
+        this._resizeByTouch = isTouchEventType(event.type());
+        this._resizeTouchSlot = this._resizeByTouch ? touchSlot(event) : null;
         if (this._keyboard && this._keyboard._beginInteractiveMotion)
             this._keyboard._beginInteractiveMotion('resize');
         // Track on the stage for the whole drag.  The visible grip is
         // intentionally tiny, so relying on grip-local motion events
         // loses the resize as soon as the pointer leaves the glyph.
         this._connectStageTracking();
-        this._startPointerPoll();
+        // A finger resize follows its own touch events; the mouse
+        // pointer the poll reads does not move with the finger.
+        if (!this._resizeByTouch)
+            this._startPointerPoll();
         return Clutter.EVENT_STOP;
     }
 
+    // Whether `event` comes from the input that owns the current resize:
+    // the same finger for a touch resize, the mouse/stylus otherwise.
+    _isResizeEvent(event) {
+        let type = null;
+        try { type = event.type(); } catch (_e) { return false; }
+        if (isTouchEventType(type) !== this._resizeByTouch)
+            return false;
+        return !isOtherFinger(event, this._resizeTouchSlot);
+    }
+
     _onMotion(_actor, event) {
-        if (this._startX === null) return Clutter.EVENT_PROPAGATE;
+        if (this._startX === null || !this._isResizeEvent(event))
+            return Clutter.EVENT_PROPAGATE;
         this._queueResizeFromEvent(event);
+        return Clutter.EVENT_STOP;
+    }
+
+    _onTouchEvent(_actor, event) {
+        const type = event.type();
+        if (type === Clutter.EventType.TOUCH_BEGIN)
+            return this.beginResizeFromEvent(event);
+        if (this._startX === null || !this._isResizeEvent(event))
+            return Clutter.EVENT_PROPAGATE;
+        if (type === Clutter.EventType.TOUCH_UPDATE) {
+            this._queueResizeFromEvent(event);
+            return Clutter.EVENT_STOP;
+        }
+        if (type === Clutter.EventType.TOUCH_END)
+            this._queueResizeFromEvent(event);
+        this._finishResize();
         return Clutter.EVENT_STOP;
     }
 
@@ -1201,15 +1409,18 @@ class OSKResizeGrip extends St.Button {
         }
         if (type === Clutter.EventType.MOTION
             || type === Clutter.EventType.TOUCH_UPDATE) {
-            if (this._startX === null) return Clutter.EVENT_PROPAGATE;
+            if (this._startX === null || !this._isResizeEvent(event))
+                return Clutter.EVENT_PROPAGATE;
             this._queueResizeFromEvent(event);
             return Clutter.EVENT_STOP;
         }
         if (type === Clutter.EventType.BUTTON_RELEASE
             || type === Clutter.EventType.TOUCH_END
             || type === Clutter.EventType.TOUCH_CANCEL) {
-            if (this._startX === null) return Clutter.EVENT_PROPAGATE;
-            this._queueResizeFromEvent(event);
+            if (this._startX === null || !this._isResizeEvent(event))
+                return Clutter.EVENT_PROPAGATE;
+            if (type !== Clutter.EventType.TOUCH_CANCEL)
+                this._queueResizeFromEvent(event);
             this._finishResize();
             return Clutter.EVENT_STOP;
         }
@@ -1241,10 +1452,24 @@ class OSKResizeGrip extends St.Button {
     _onStageCapturedEvent(event) {
         if (this._startX === null) return Clutter.EVENT_PROPAGATE;
         const type = event.type();
+        if (!this._isResizeEvent(event)) return Clutter.EVENT_PROPAGATE;
+        // Touch slots are reused, so a new finger with this resize's
+        // slot means its lift never reached us.
+        if (type === Clutter.EventType.TOUCH_BEGIN) {
+            this._finishResize();
+            return Clutter.EVENT_PROPAGATE;
+        }
+        // Mouse motion is read by the pointer poll; a finger's motion
+        // arrives only as touch events.
+        if (type === Clutter.EventType.TOUCH_UPDATE) {
+            this._queueResizeFromEvent(event);
+            return Clutter.EVENT_STOP;
+        }
         if (type === Clutter.EventType.BUTTON_RELEASE
             || type === Clutter.EventType.TOUCH_END
             || type === Clutter.EventType.TOUCH_CANCEL) {
-            this._queueResizeFromEvent(event);
+            if (type !== Clutter.EventType.TOUCH_CANCEL)
+                this._queueResizeFromEvent(event);
             this._finishResize();
             return Clutter.EVENT_STOP;
         }
@@ -1337,6 +1562,8 @@ class OSKResizeGrip extends St.Button {
         if (this._startX === null) return;
         this._startX = null;
         this._startY = null;
+        this._resizeByTouch = false;
+        this._resizeTouchSlot = null;
         this._disconnectStageTracking();
         this._stopPointerPoll();
         this._applyPendingResize();
@@ -1385,6 +1612,7 @@ class OSKPredictionButton extends St.Button {
         this._pressed = false;
         this._suggestionText = '';
         this._lastSuggestionStyleValue = '';
+        this._touchSlot = null;
         this._predictionLabel = new St.Label({
             text: '',
             x_align: Clutter.ActorAlign.CENTER,
@@ -1413,6 +1641,11 @@ class OSKPredictionButton extends St.Button {
             this._keyboard.onPredictionClicked(this._slotIndex);
             return Clutter.EVENT_STOP;
         });
+        // Fingers: same press/lift handling the captured-event path uses.
+        this.connect('touch-event', (_actor, event) => {
+            if (this._isEmpty) return Clutter.EVENT_PROPAGATE;
+            return this.handleCapturedPointerEvent(event);
+        });
         this.connect('notify::hover', () => {
             this._hovering = this.hover;
             if (!this._hovering) this._pressed = false;
@@ -1425,10 +1658,14 @@ class OSKPredictionButton extends St.Button {
         const type = event.type();
         if (type === Clutter.EventType.BUTTON_PRESS ||
             type === Clutter.EventType.TOUCH_BEGIN) {
+            this._touchSlot = touchSlot(event);
             this._pressed = true;
             this._updateStyle();
             return Clutter.EVENT_STOP;
         }
+        // Only the finger that pressed the suggestion can pick it.
+        if (isTouchEventType(type) && isOtherFinger(event, this._touchSlot))
+            return Clutter.EVENT_STOP;
         if (type === Clutter.EventType.BUTTON_RELEASE ||
             type === Clutter.EventType.TOUCH_END) {
             this._pressed = false;
@@ -1793,16 +2030,13 @@ export const OSKKeyboard = GObject.registerClass({
 
     _onKeyboardCapturedEvent(event) {
         const type = event.type && event.type();
-        if (type !== Clutter.EventType.BUTTON_PRESS)
+        if (type !== Clutter.EventType.BUTTON_PRESS
+            && type !== Clutter.EventType.TOUCH_BEGIN)
             return Clutter.EVENT_PROPAGATE;
         if (!this._grip || !this._eventInResizeCorner(event))
             return Clutter.EVENT_PROPAGATE;
-        try {
-            if (event.get_button && event.get_button() !== 1)
-                return Clutter.EVENT_PROPAGATE;
-        } catch (_e) {
+        if (eventButton(event) !== 1)
             return Clutter.EVENT_PROPAGATE;
-        }
         return this._grip.beginResizeFromEvent(event);
     }
 
