@@ -64,6 +64,7 @@ import {
 import {
     OSK_MODAL_HOVER_THROTTLE_US, isAuthSessionModeName,
     isPointerLikeEventType, isPointerTrackingOnlyEventType,
+    isOtherFinger, isTouchEventType, touchSlot,
 } from './modalAuth.js';
 
 const DWELL_TYPING_POLL_MS = 50;
@@ -1178,20 +1179,17 @@ export default class OSKExtension extends Extension {
         let startX = null, startY = null;
         let origW = 0, origH = 0;
         let stageGrab = null;
+        // Set while a finger (rather than the mouse) drives the resize.
+        let touchActive = false;
+        let touchFinger = null;
 
-        grip.connect('button-press-event', (_a, ev) => {
-            if (ev.get_button() !== 1) return Clutter.EVENT_PROPAGATE;
+        const begin = ev => {
             const [x, y] = ev.get_coords();
             startX = x; startY = y;
             origW = target.width;
             origH = target.height;
-            try {
-                if (global.stage.grab) stageGrab = global.stage.grab(grip);
-            } catch (_e) { stageGrab = null; }
-            return Clutter.EVENT_STOP;
-        });
-        grip.connect('motion-event', (_a, ev) => {
-            if (startX === null) return Clutter.EVENT_PROPAGATE;
+        };
+        const resizeTo = ev => {
             const [x, y] = ev.get_coords();
             const newW = Math.max(
                 CUSTOMIZE_WINDOW_MIN_WIDTH,
@@ -1200,9 +1198,24 @@ export default class OSKExtension extends Extension {
                 CUSTOMIZE_WINDOW_MIN_HEIGHT,
                 Math.round(origH + (y - startY)));
             target.set_size(newW, newH);
+        };
+
+        grip.connect('button-press-event', (_a, ev) => {
+            if (ev.get_button() !== 1) return Clutter.EVENT_PROPAGATE;
+            touchActive = false;
+            begin(ev);
+            try {
+                if (global.stage.grab) stageGrab = global.stage.grab(grip);
+            } catch (_e) { stageGrab = null; }
+            return Clutter.EVENT_STOP;
+        });
+        grip.connect('motion-event', (_a, ev) => {
+            if (startX === null || touchActive) return Clutter.EVENT_PROPAGATE;
+            resizeTo(ev);
             return Clutter.EVENT_STOP;
         });
         grip.connect('button-release-event', () => {
+            if (touchActive) return Clutter.EVENT_PROPAGATE;
             startX = null;
             startY = null;
             if (stageGrab) {
@@ -1210,6 +1223,29 @@ export default class OSKExtension extends Extension {
                 stageGrab = null;
             }
             return Clutter.EVENT_PROPAGATE;
+        });
+        // Fingers: Clutter keeps sending a touch to the actor it started
+        // on, so no grab is needed.
+        grip.connect('touch-event', (_a, ev) => {
+            const type = ev.type();
+            if (type === Clutter.EventType.TOUCH_BEGIN) {
+                touchActive = true;
+                touchFinger = touchSlot(ev);
+                begin(ev);
+                return Clutter.EVENT_STOP;
+            }
+            if (startX === null || !touchActive || isOtherFinger(ev, touchFinger))
+                return Clutter.EVENT_PROPAGATE;
+            if (type !== Clutter.EventType.TOUCH_CANCEL)
+                resizeTo(ev);
+            if (type === Clutter.EventType.TOUCH_END
+                || type === Clutter.EventType.TOUCH_CANCEL) {
+                startX = null;
+                startY = null;
+                touchActive = false;
+                touchFinger = null;
+            }
+            return Clutter.EVENT_STOP;
         });
 
         return grip;
@@ -1237,28 +1273,62 @@ export default class OSKExtension extends Extension {
         let dragStart = null;
         let origPos = null;
         let grab = null;
-        titleLbl.connect('button-press-event', (_a, ev) => {
-            if (ev.get_button() !== 1) return Clutter.EVENT_PROPAGATE;
+        // Set while a finger (rather than the mouse) drives the drag.
+        let touchActive = false;
+        let touchFinger = null;
+        const begin = ev => {
             const [x, y] = ev.get_coords();
             dragStart = [x, y];
             origPos = [win.get_x(), win.get_y()];
+        };
+        const moveTo = ev => {
+            const [x, y] = ev.get_coords();
+            win.set_position(
+                Math.round(origPos[0] + (x - dragStart[0])),
+                Math.round(origPos[1] + (y - dragStart[1])));
+        };
+        titleLbl.connect('button-press-event', (_a, ev) => {
+            if (ev.get_button() !== 1) return Clutter.EVENT_PROPAGATE;
+            touchActive = false;
+            begin(ev);
             try {
                 if (global.stage.grab) grab = global.stage.grab(titleLbl);
             } catch (_e) { grab = null; }
             return Clutter.EVENT_STOP;
         });
         titleLbl.connect('motion-event', (_a, ev) => {
-            if (!dragStart) return Clutter.EVENT_PROPAGATE;
-            const [x, y] = ev.get_coords();
-            win.set_position(
-                Math.round(origPos[0] + (x - dragStart[0])),
-                Math.round(origPos[1] + (y - dragStart[1])));
+            if (!dragStart || touchActive) return Clutter.EVENT_PROPAGATE;
+            moveTo(ev);
             return Clutter.EVENT_STOP;
         });
         titleLbl.connect('button-release-event', () => {
+            if (touchActive) return Clutter.EVENT_PROPAGATE;
             dragStart = null; origPos = null;
             if (grab) { try { grab.dismiss(); } catch (_e) { } grab = null; }
             return Clutter.EVENT_PROPAGATE;
+        });
+        // Fingers: Clutter keeps sending a touch to the actor it started
+        // on, so no grab is needed.
+        titleLbl.connect('touch-event', (_a, ev) => {
+            const type = ev.type();
+            if (type === Clutter.EventType.TOUCH_BEGIN) {
+                touchActive = true;
+                touchFinger = touchSlot(ev);
+                begin(ev);
+                return Clutter.EVENT_STOP;
+            }
+            if (!dragStart || !touchActive || isOtherFinger(ev, touchFinger))
+                return Clutter.EVENT_PROPAGATE;
+            if (type !== Clutter.EventType.TOUCH_CANCEL)
+                moveTo(ev);
+            if (type === Clutter.EventType.TOUCH_END
+                || type === Clutter.EventType.TOUCH_CANCEL) {
+                dragStart = null;
+                origPos = null;
+                touchActive = false;
+                touchFinger = null;
+            }
+            return Clutter.EVENT_STOP;
         });
         bar.add_child(titleLbl);
 
@@ -2737,9 +2807,13 @@ export default class OSKExtension extends Extension {
         panel.connect('button-press-event',
             (_a, e) => this._pickerOnPress(e));
         panel.connect('motion-event',
-            (_a, e) => this._pickerOnMotion(e));
+            (_a, e) => this._pickerDragByTouch
+                ? Clutter.EVENT_PROPAGATE : this._pickerOnMotion(e));
         panel.connect('button-release-event',
-            (_a, e) => this._pickerOnRelease(e));
+            (_a, e) => this._pickerDragByTouch
+                ? Clutter.EVENT_PROPAGATE : this._pickerOnRelease(e));
+        panel.connect('touch-event',
+            (_a, e) => this._pickerOnTouch(e));
 
         // State: track HSV separately from hex so drag operations
         // don't suffer HSV->hex->HSV rounding drift.
@@ -2925,16 +2999,38 @@ export default class OSKExtension extends Extension {
         if (!target) return Clutter.EVENT_PROPAGATE;
 
         this._pickerActiveDrag = target;
+        this._pickerDragByTouch = isTouchEventType(event.type());
+        this._pickerTouchSlot = this._pickerDragByTouch
+            ? touchSlot(event) : null;
         // Pointer grab so motion + release fire even if the cursor
-        // leaves the picker panel mid-drag.
-        try {
-            if (global.stage.grab) {
-                this._pickerGrab = global.stage.grab(this._picker);
-            }
-        } catch (_e) { this._pickerGrab = null; }
+        // leaves the picker panel mid-drag.  A finger's touch events
+        // already keep going to the panel it started on.
+        if (!this._pickerDragByTouch) {
+            try {
+                if (global.stage.grab) {
+                    this._pickerGrab = global.stage.grab(this._picker);
+                }
+            } catch (_e) { this._pickerGrab = null; }
+        }
 
         if (target === 'sv') this._pickerSvHandle(sx, sy);
         else this._pickerHueHandle(sx, sy);
+        return Clutter.EVENT_STOP;
+    }
+
+    // Finger drags on the saturation/value square and the hue strip.
+    _pickerOnTouch(event) {
+        const type = event.type();
+        if (type === Clutter.EventType.TOUCH_BEGIN)
+            return this._pickerOnPress(event);
+        if (!this._pickerActiveDrag || !this._pickerDragByTouch
+            || isOtherFinger(event, this._pickerTouchSlot))
+            return Clutter.EVENT_PROPAGATE;
+        if (type === Clutter.EventType.TOUCH_UPDATE)
+            return this._pickerOnMotion(event);
+        if (type === Clutter.EventType.TOUCH_END)
+            this._pickerOnMotion(event);
+        this._pickerOnRelease(event);
         return Clutter.EVENT_STOP;
     }
 
@@ -2949,6 +3045,8 @@ export default class OSKExtension extends Extension {
     _pickerOnRelease(_event) {
         if (!this._pickerActiveDrag) return Clutter.EVENT_PROPAGATE;
         this._pickerActiveDrag = null;
+        this._pickerDragByTouch = false;
+        this._pickerTouchSlot = null;
         if (this._pickerGrab) {
             try { this._pickerGrab.dismiss(); } catch (_e) { }
             this._pickerGrab = null;
@@ -4986,12 +5084,15 @@ export default class OSKExtension extends Extension {
         const type = event.type();
         if (!this._isPointerLikeEvent(type))
             return false;
+        this._dropFinishedMousePress(event, type);
 
         const keyboard = this._keyboardOrNull('_maybeHandleShellKeyboardEvent');
         if (!keyboard || !keyboard.visible) {
             this._clearCapturedHover();
             return false;
         }
+        if (this._keyboardMotionOutsideBridge(keyboard))
+            return false;
 
         let x, y;
         try {
@@ -5051,8 +5152,10 @@ export default class OSKExtension extends Extension {
         let target = this._modalPointerTarget || null;
         if (!target || startsPointerSequence) {
             target = hitHandler || null;
-            if (startsPointerSequence)
+            if (startsPointerSequence) {
                 this._modalPointerTarget = target;
+                this._modalPointerTargetIsTouch = isTouchEventType(type);
+            }
         }
 
         if (!target || !this._isKeyboardDescendant(target))
@@ -5078,6 +5181,32 @@ export default class OSKExtension extends Extension {
             this._modalPointerTarget = null;
 
         return result !== Clutter.EVENT_PROPAGATE;
+    }
+
+    // A mouse press the bridges routed can finish where they never see
+    // its release: the title bar's mouse drag takes its own grab, so the
+    // release goes straight to the title bar.  The leftover target then
+    // swallowed every later mouse motion on the desktop until the next
+    // click.  A motion with no button held means that press is over.
+    _dropFinishedMousePress(event, type) {
+        if (type !== Clutter.EventType.MOTION || !this._modalPointerTarget
+            || this._modalPointerTargetIsTouch)
+            return;
+        if (!this._eventHasButtonOrTouchGrab(event, type))
+            this._modalPointerTarget = null;
+    }
+
+    // True while the keyboard is being dragged or resized by a press the
+    // bridges did not route (they track their own via _modalPointerTarget).
+    _keyboardMotionOutsideBridge(keyboard) {
+        if (this._modalPointerTarget)
+            return false;
+        try {
+            return !!(keyboard._isInteractiveMotionPaused
+                && keyboard._isInteractiveMotionPaused());
+        } catch (_e) {
+            return false;
+        }
     }
 
     _shouldUseShellKeyboardEventBridge() {
@@ -5205,10 +5334,16 @@ export default class OSKExtension extends Extension {
             type !== Clutter.EventType.TOUCH_CANCEL) {
             return Clutter.EVENT_PROPAGATE;
         }
+        this._dropFinishedMousePress(event, type);
         const keyboard = this._keyboardOrNull('_onStageCapturedEvent');
         if (!keyboard)
             return Clutter.EVENT_PROPAGATE;
         if (!keyboard.visible)
+            return Clutter.EVENT_PROPAGATE;
+        // A drag or resize that started without this bridge (e.g. the
+        // resize corner) follows its own stage tracking; don't take its
+        // finger motion or release away from it.
+        if (this._keyboardMotionOutsideBridge(keyboard))
             return Clutter.EVENT_PROPAGATE;
 
         let x, y;
@@ -5281,8 +5416,10 @@ export default class OSKExtension extends Extension {
         let target = this._modalPointerTarget || null;
         if (!target || startsPointerSequence) {
             target = capturedHandler;
-            if (startsPointerSequence)
+            if (startsPointerSequence) {
                 this._modalPointerTarget = target || null;
+                this._modalPointerTargetIsTouch = isTouchEventType(type);
+            }
         }
         if (!target || !this._isKeyboardDescendant(target))
             return Clutter.EVENT_PROPAGATE;
