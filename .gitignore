@@ -1,0 +1,11 @@
+.claude/
+
+# Local install/runtime artifacts
+wordlist.txt
+*.tmp
+*.log
+dist/
+
+# Editor and OS metadata
+.DS_Store
+Thumbs.db
