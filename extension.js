@@ -16,13 +16,17 @@
  *     synthesize real evdev key events at the compositor level.  These
  *     go to whichever window currently holds keyboard focus -- which is
  *     still the terminal, because the chrome tap didn't take it away.
+ *   - Never touch window focus, the same as a hardware keyboard.  Do
+ *     not activate() or re-focus the app window before a key: for X11
+ *     apps that keep focus in a child window (Steam's embedded
+ *     Chromium is one), Mutter re-focuses the outer window, the text
+ *     box loses focus, and the key is lost.
  */
 
 import Clutter from 'gi://Clutter';
 import St from 'gi://St';
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
-import Meta from 'gi://Meta';
 // Cairo is the drawing backend used by the RGB row glow canvases and
 // the color wheel widget.  GJS exposes it under the 'cairo' import
 // (no `gi://` prefix).
@@ -177,8 +181,6 @@ export default class OSKExtension extends Extension {
         this._shellKeyboardBridgeManager = null;
         this._shellKeyboardBridgeOriginal = null;
         this._shellKeyboardBridgeWrapper = null;
-        this._focusWindowNotifyId = 0;
-        this._lastFocusedWindow = null;
         try {
             if (Main.sessionMode && Main.sessionMode.connect) {
                 this._sessionModeUpdatedId = Main.sessionMode.connect(
@@ -251,10 +253,6 @@ export default class OSKExtension extends Extension {
                                          initialLayoutKey,
                                          initialCustomization,
                                          initialUserThemes);
-        if (this._keyboard.setBeforeKeyDispatchCallback) {
-            this._keyboard.setBeforeKeyDispatchCallback(
-                () => this._preserveFocusedWindowForKey());
-        }
         const keyboardActor = this._keyboard;
         keyboardActor.connect('destroy', () => {
             if (this._keyboard === keyboardActor) {
@@ -323,7 +321,6 @@ export default class OSKExtension extends Extension {
             this._installModalAwareInput();
         if (!this._authSessionMode)
             this._installShellKeyboardEventBridge();
-        this._installFocusWindowTracker();
         this._installModalRaiseHooks();
 
         // One-line diagnostic to journal so we can see what coords were
@@ -3946,7 +3943,6 @@ export default class OSKExtension extends Extension {
         this._cancelAuthVisibilityRetry();
         _clearSource(this, '_predictorLoadId');
         this._stopDwellPointerPoll();
-        this._uninstallFocusWindowTracker();
         this._uninstallModalRaiseHooks();
         this._leaveModalBridge('disable', false);
 
@@ -4055,109 +4051,6 @@ export default class OSKExtension extends Extension {
         // Null out the virtual device; its lifetime is tied to the seat,
         // there's no explicit destroy.
         this._virtualDevice = null;
-    }
-
-    _installFocusWindowTracker() {
-        if (!global.display || this._focusWindowNotifyId)
-            return;
-        try {
-            this._focusWindowNotifyId = global.display.connect(
-                'notify::focus-window',
-                () => this._rememberFocusedWindow());
-            this._rememberFocusedWindow();
-        } catch (e) {
-            this._focusWindowNotifyId = 0;
-            log(`gnome-osk: focus-window tracker unavailable: ${e}`);
-        }
-    }
-
-    _uninstallFocusWindowTracker() {
-        if (this._focusWindowNotifyId && global.display) {
-            try { global.display.disconnect(this._focusWindowNotifyId); }
-            catch (_e) {}
-        }
-        this._focusWindowNotifyId = 0;
-        this._lastFocusedWindow = null;
-    }
-
-    _focusedWindow() {
-        try {
-            if (global.display && global.display.focus_window)
-                return global.display.focus_window;
-        } catch (_e) {}
-        try {
-            if (global.display && global.display.get_focus_window)
-                return global.display.get_focus_window();
-        } catch (_e) {}
-        return null;
-    }
-
-    _isUsableFocusWindow(win) {
-        if (!win)
-            return false;
-        try {
-            if (win.is_hidden && win.is_hidden())
-                return false;
-        } catch (_e) {}
-        try {
-            if (win.minimized)
-                return false;
-        } catch (_e) {}
-        try {
-            if (win.get_window_type) {
-                const type = win.get_window_type();
-                if (type === Meta.WindowType.DESKTOP
-                    || type === Meta.WindowType.DOCK)
-                    return false;
-            }
-        } catch (_e) {}
-        try {
-            if (win.get_compositor_private && !win.get_compositor_private())
-                return false;
-        } catch (_e) {}
-        return true;
-    }
-
-    _rememberFocusedWindow() {
-        const win = this._focusedWindow();
-        if (this._isUsableFocusWindow(win))
-            this._lastFocusedWindow = win;
-    }
-
-    _currentEventTimestamp() {
-        try {
-            if (global.get_current_time)
-                return global.get_current_time();
-        } catch (_e) {}
-        try {
-            if (Clutter.get_current_event) {
-                const event = Clutter.get_current_event();
-                if (event && event.get_time)
-                    return event.get_time();
-            }
-        } catch (_e) {}
-        return Math.floor(GLib.get_monotonic_time() / 1000);
-    }
-
-    _preserveFocusedWindowForKey() {
-        if (this._authSessionMode || this._isAnyModalActive(true))
-            return;
-
-        // App popups and inline rename fields can drop focus when the
-        // pointer lands on Shell chrome. Re-assert the last real app
-        // window immediately before sending the virtual key.
-        const focused = this._focusedWindow();
-        const target = this._isUsableFocusWindow(focused)
-            ? focused
-            : this._lastFocusedWindow;
-        if (!this._isUsableFocusWindow(target))
-            return;
-
-        this._lastFocusedWindow = target;
-        try {
-            if (target.activate)
-                target.activate(this._currentEventTimestamp());
-        } catch (_e) {}
     }
 
     _setDwellTypingEnabled(enabled, persist = false) {

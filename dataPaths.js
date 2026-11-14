@@ -9,7 +9,7 @@ import GLib from 'gi://GLib';
 // Bump this when you make user-visible behaviour changes -- it shows
 // up in the journal so we can tell at a glance whether the installed
 // files actually match the build we're trying to ship.
-export const OSK_BUILD_TAG = 'v28';
+export const OSK_BUILD_TAG = 'v29';
 
 
 // ========================================================================

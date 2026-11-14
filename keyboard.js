@@ -1834,7 +1834,6 @@ export const OSKKeyboard = GObject.registerClass({
         this._modifiers = { SHIFT: MOD_OFF, CTRL: MOD_OFF, ALT: MOD_OFF, META: MOD_OFF };
         this._modButtons = { SHIFT: [], CTRL: [], ALT: [], META: [] };
         this._shiftedButtons = [];
-        this._beforeKeyDispatchCallback = null;
 
         // Hold-to-repeat settings read by OSKKey on every press.  Kept
         // on the keyboard (not the keys) so the "Key repeat" menu can
@@ -1931,11 +1930,6 @@ export const OSKKeyboard = GObject.registerClass({
                 (_actor, event) => this._onKeyboardCapturedEvent(event));
         } catch (_e) {}
         this.connect('notify::visible', () => this._onVisibilityChanged());
-    }
-
-    setBeforeKeyDispatchCallback(callback) {
-        this._beforeKeyDispatchCallback =
-            typeof callback === 'function' ? callback : null;
     }
 
     vfunc_get_preferred_width(forHeight) {
@@ -5512,11 +5506,10 @@ export const OSKKeyboard = GObject.registerClass({
         this._sendChord(mods, kc);
     }
 
+    // Keys go wherever keyboard focus already is, like a hardware
+    // keyboard.  Don't add focus/activate calls here: re-focusing the
+    // app window steals focus from X11 child windows (Steam/CEF).
     _sendChord(modKeycodes, keycode) {
-        if (this._beforeKeyDispatchCallback) {
-            try { this._beforeKeyDispatchCallback(keycode, modKeycodes); }
-            catch (_e) {}
-        }
         const time = GLib.get_monotonic_time();
         for (const m of modKeycodes) {
             this._virtualDevice.notify_key(time, m, Clutter.KeyState.PRESSED);
